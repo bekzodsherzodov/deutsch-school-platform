@@ -1,0 +1,188 @@
+@import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --color-ink: #0c1b4a;          /* sarlavha matni */
+  --color-ink-soft: #4a5b8c;     /* ikkinchi darajali matn */
+  --color-brand-50: #eef4ff;
+  --color-brand-100: #dce8ff;
+  --color-brand-500: #2f66f0;
+  --color-brand-600: #1f4fe0;
+  --color-brand-700: #0b3bd1;
+  --color-violet-soft: #ede7ff;
+  --color-violet-brand: #7c5cf0;
+  --color-mint-soft: #dcf7ea;
+  --color-mint-brand: #12b981;
+  --color-amber-soft: #fff1d6;
+  --color-amber-brand: #f59e0b;
+  --color-rose-soft: #ffe3e6;
+  --color-rose-brand: #ef4458;
+  --shadow-card: 0 10px 30px -12px rgb(31 79 224 / 0.22), 0 2px 6px -2px rgb(31 79 224 / 0.08);
+  --shadow-btn: 0 10px 22px -8px rgb(11 59 209 / 0.65);
+}
+
+/* O‘lcham: telefonda 16px, planshetda 17px, kompyuterda 18px — hamma rem birliklar shunga qarab kattalashadi */
+html { font-size: 16px; -webkit-text-size-adjust: 100%; }
+@media (min-width: 768px) { html { font-size: 17px; } }
+@media (min-width: 1280px) { html { font-size: 18px; } }
+@media (min-width: 1920px) { html { font-size: 20px; } }
+html, body, #root { min-height: 100dvh; }
+
+body {
+  @apply font-sans text-ink antialiased;
+  background:
+    radial-gradient(1100px 520px at 85% -10%, #cfe0ff 0%, transparent 60%),
+    radial-gradient(700px 480px at 0% 0%, #dbe7ff 0%, transparent 55%),
+    linear-gradient(180deg, #eef3ff 0%, #f8faff 60%, #ffffff 100%);
+  background-attachment: fixed;
+}
+
+/* Shisha ko‘rinishidagi karta */
+.card {
+  @apply rounded-3xl border border-white/80 bg-white/80 shadow-card backdrop-blur-md;
+}
+.card-flat {
+  @apply rounded-2xl bg-brand-50/70;
+}
+
+/* Asosiy to‘q ko‘k tugma */
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-full px-6 py-3 text-sm font-semibold text-white shadow-btn transition active:scale-[0.98] disabled:opacity-60;
+  background: linear-gradient(180deg, #2f66f0 0%, #0b3bd1 100%);
+}
+.btn-primary:hover { filter: brightness(1.06); }
+
+.btn-soft {
+  @apply inline-flex items-center justify-center gap-2 rounded-full bg-white px-4 py-2 text-sm font-semibold text-brand-600 shadow-card transition hover:bg-brand-50;
+}
+
+.field {
+  @apply w-full rounded-2xl border border-brand-100 bg-white/90 px-4 py-3 text-base text-ink outline-none transition placeholder:text-ink-soft/60 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15;
+}
+
+:focus-visible { outline: 2px solid var(--color-brand-500); outline-offset: 2px; }
+
+.thin-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: #c9d8ff; border-radius: 99px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* =====================================================================
+   ANIMATSIYALAR — faqat harakat qo‘shilgan; ranglar, o‘lchamlar, matn va
+   joylashuvga tegilmagan. Tizimda “harakatni kamaytirish” yoqilgan bo‘lsa,
+   pastdagi @media bloki hammasini o‘chiradi.
+   ===================================================================== */
+:root { --ease: cubic-bezier(.22, .8, .24, 1); }
+html { scroll-behavior: smooth; }
+
+@keyframes dsFadeUp   { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+@keyframes dsFadeIn   { from { opacity: 0; } to { opacity: 1; } }
+@keyframes dsDown     { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: none; } }
+@keyframes dsRight    { from { opacity: 0; transform: translateX(-18px); } to { opacity: 1; transform: none; } }
+@keyframes dsPop      { 0% { opacity: 0; transform: scale(.6); } 70% { opacity: 1; transform: scale(1.08); } 100% { opacity: 1; transform: none; } }
+@keyframes dsGrow     { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes dsDraw     { from { stroke-dashoffset: 420; } to { stroke-dashoffset: 0; } }
+@keyframes dsFloat    { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+@keyframes dsTwinkle  { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.7); } }
+@keyframes dsWiggle   { 0%, 100% { rotate: 0deg; } 20% { rotate: 16deg; } 40% { rotate: -14deg; } 60% { rotate: 9deg; } 80% { rotate: -5deg; } }
+@keyframes dsPing     { 0% { transform: scale(1); opacity: .7; } 80%, 100% { transform: scale(2.6); opacity: 0; } }
+@keyframes dsMenu     { from { opacity: 0; transform: translateY(-6px) scale(.95); } to { opacity: 1; transform: none; } }
+@keyframes dsDrawer   { from { transform: translateX(-100%); } to { transform: none; } }
+@keyframes dsShake    { 0%, 100% { transform: none; } 20% { transform: translateX(-7px); } 40% { transform: translateX(6px); } 60% { transform: translateX(-4px); } 80% { transform: translateX(3px); } }
+@keyframes dsDrift    { 0%, 100% { transform: translate(0, 0); } 50% { transform: translate(18px, 14px); } }
+@keyframes dsShine    { from { transform: translateX(-130%) skewX(-20deg); } to { transform: translateX(260%) skewX(-20deg); } }
+
+/* ---- Navbatma-navbat chiqish uchun indekslar ---- */
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(1) { --i: 0; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(2) { --i: 1; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(3) { --i: 2; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(4) { --i: 3; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(5) { --i: 4; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(6) { --i: 5; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(7) { --i: 6; }
+:is(main > * > *, main .grid > *, main li, main tbody tr, aside nav button, aside nav > div, form > *, .py-8.text-center > *):nth-child(n+8) { --i: 7; }
+aside nav > div:nth-child(2) { --g: 4; }
+aside nav > div:nth-child(3) { --g: 9; }
+
+/* ---- Yuqori panel ---- */
+.mx-auto > header { animation: dsDown .6s var(--ease) backwards; }
+
+/* ---- Sidebar ---- */
+aside > div > :first-child { animation: dsRight .6s var(--ease) backwards; }
+aside nav > div { animation: dsFadeIn .5s var(--ease) calc(var(--g, 0) * 45ms + 100ms) backwards; }
+aside nav button { animation: dsRight .5s var(--ease) calc((var(--g, 0) + var(--i, 0)) * 45ms + 160ms) backwards; }
+aside > div > :last-child { animation: dsFadeUp .6s var(--ease) .6s backwards; }
+aside nav button[aria-current="page"] > svg { animation: dsPop .6s var(--ease) .55s backwards; }
+aside nav button > svg { transition: translate .25s var(--ease), scale .25s var(--ease); }
+aside nav button { transition: background-color .2s, color .2s, translate .25s var(--ease), scale .15s, box-shadow .25s; }
+aside nav button:hover { translate: 3px 0; }
+aside nav button:hover > svg { translate: 1px 0; scale: 1.12; }
+aside nav button:active { scale: .98; }
+/* telefon menyusi */
+.fixed.inset-0.z-40 > .absolute.inset-0 { animation: dsFadeIn .25s ease backwards; }
+.fixed.inset-0.z-40 > aside { animation: dsDrawer .35s var(--ease) backwards; }
+
+/* ---- Asosiy qism: sahifa bo‘limlari ---- */
+main > * > * { animation: dsFadeUp .65s var(--ease) calc(var(--i, 0) * 90ms + 80ms) backwards; }
+main > .card { animation: dsFadeUp .65s var(--ease) .08s backwards; }
+main .grid > * { animation: dsFadeUp .6s var(--ease) calc(var(--i, 0) * 90ms + 260ms) backwards; }
+main li, main tbody tr { animation: dsFadeUp .45s var(--ease) calc(var(--i, 0) * 55ms + 300ms) backwards; }
+main iframe { animation: dsFadeIn .6s ease .1s backwards; }
+.py-8.text-center > * { animation: dsFadeUp .55s var(--ease) calc(var(--i, 0) * 90ms + 350ms) backwards; }
+.h-1.w-24.rounded-full { transform-origin: left; animation: dsGrow .7s var(--ease) .45s backwards; }
+
+/* ---- Kartalar ---- */
+.card { transition: translate .35s var(--ease), box-shadow .35s var(--ease); }
+.card:hover { translate: 0 -3px; box-shadow: 0 22px 44px -16px rgb(31 79 224 / .30), 0 3px 8px -2px rgb(31 79 224 / .10); }
+/* Qidiruv: input ustiga bosilganda chegara yoki halqa chiqmasin */
+header label.card input:focus, header label.card input:focus-visible { outline: none !important; box-shadow: none !important; border-color: transparent !important; }
+header label.card:hover, header label.card:focus-within { translate: none; box-shadow: var(--shadow-card); }
+
+/* ---- Statistika kartalari ---- */
+.size-16.place-items-center { animation: dsPop .7s var(--ease) .45s backwards; transition: rotate .35s var(--ease), scale .35s var(--ease); }
+.card:hover > .relative .size-16, .card:hover .size-16.place-items-center { rotate: -6deg; scale: 1.06; }
+.text-4xl.font-extrabold { animation: dsFadeUp .7s var(--ease) .6s backwards; }
+svg[viewBox="0 0 160 60"] path:first-of-type { animation: dsFadeIn 1.1s ease .7s backwards; }
+svg[viewBox="0 0 160 60"] path:last-of-type { stroke-dasharray: 420; animation: dsDraw 1.4s var(--ease) .6s backwards; }
+
+/* ---- Kubok rasmi ---- */
+svg[viewBox="0 0 200 150"] { animation: dsFloat 4.5s ease-in-out infinite; }
+svg[viewBox="0 0 200 150"] path:last-of-type { transform-box: fill-box; transform-origin: center; animation: dsTwinkle 2.4s ease-in-out infinite; }
+
+/* ---- Tugmalar ---- */
+.btn-primary { position: relative; overflow: hidden; transition: transform .2s var(--ease), filter .2s, box-shadow .25s; }
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 16px 28px -10px rgb(11 59 209 / .7); }
+.btn-primary::after { content: ""; position: absolute; inset: 0; width: 40%; background: linear-gradient(90deg, transparent, rgb(255 255 255 / .35), transparent); transform: translateX(-130%) skewX(-20deg); pointer-events: none; }
+.btn-primary:hover::after { animation: dsShine .8s ease; }
+.btn-primary > svg { transition: translate .25s var(--ease); }
+.btn-primary:hover > svg { translate: 3px 0; }
+.btn-soft:hover { transform: translateY(-2px); }
+main button > svg { transition: translate .25s var(--ease), scale .25s var(--ease); }
+main button:hover > svg { translate: 0 -1px; scale: 1.12; }
+
+/* ---- Qo‘ng‘iroqcha va bildirishnoma nuqtasi ---- */
+button[aria-label="Yangiliklar"]:hover > svg { animation: dsWiggle .7s ease; transform-origin: 50% 10%; }
+span.bg-rose-brand.ring-white::after { content: ""; position: absolute; inset: 0; border-radius: inherit; background: inherit; animation: dsPing 1.8s ease-out infinite; }
+
+/* ---- Foydalanuvchi menyusi ---- */
+.card.absolute.right-0.top-full { transform-origin: top right; animation: dsMenu .22s var(--ease) backwards; }
+
+/* ---- Belgilar (pill) va reyting raqamlari ---- */
+span.rounded-full.font-bold.text-xs, span.size-9.rounded-full { animation: dsPop .5s var(--ease) calc(var(--i, 0) * 55ms + 380ms) backwards; }
+span.rounded-full.font-bold.text-xs { display: inline-flex; }
+
+/* ---- Kirish sahifasi ---- */
+form.card { animation: dsFadeUp .8s var(--ease) backwards; }
+form > * { animation: dsFadeUp .55s var(--ease) calc(var(--i, 0) * 80ms + 250ms) backwards; }
+form > img { animation: dsPop .8s var(--ease) .2s backwards; }
+form [role="alert"] { animation: dsShake .45s ease, dsFadeIn .2s ease; }
+.blur-3xl { animation: dsDrift 14s ease-in-out infinite; }
+
+/* ---- Harakatni kamaytirish ---- */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

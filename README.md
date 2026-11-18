@@ -1,0 +1,40 @@
+# Deutsch School
+
+Frontend (`public/index.html`) + backend (`server.js`). Ma'lumotlar serverda (Postgres) saqlanadi, kirish parollari xeshlangan, o'qituvchilar faqat o'z sinflariga yoza oladi.
+
+## 1. GitHub'ga yuklash
+1. github.com → **New repository** (nomi: `deutsch-school`, **Private** tavsiya etiladi).
+2. Shu papkadagi hamma fayllarni yuklang (**Add file → Upload files**), `node_modules` va `.env` bo'lmasin. **Commit changes**.
+
+## 2. Bepul baza (Neon) — ma'lumot yo'qolmasligi uchun
+Render'ning bepul Postgres bazasi 30 kundan keyin o'chadi, Neon'nikida muddat yo'q.
+1. neon.tech → ro'yxatdan o'ting → yangi project yarating.
+2. **Connection string** (`postgresql://...`) ni nusxalang. Bu `DATABASE_URL` bo'ladi.
+
+## 3. Render'da joylash
+1. render.com → **New → Blueprint** → GitHub repo'ni tanlang (`render.yaml` avtomatik o'qiladi).
+2. So'ralganda kiriting:
+   - `ADMIN_USER` — masalan `deutsch_schuleee`
+   - `ADMIN_PASSWORD` — kuchli parol (8+ belgi)
+   - `DATABASE_URL` — Neon'dan nusxalangan satr
+3. **Apply** bosing. 2–3 daqiqada sayt `https://deutsch-school.onrender.com` kabi manzilda ochiladi.
+
+## Muhim
+- Bepul Render xizmati 15 daqiqa ishlatilmasa uxlaydi; birinchi ochilish ~30–60 soniya oladi.
+- Eski brauzerdagi ma'lumotni ko'chirish: avvalgi saytni ochgan brauzerda administrator bo'lib kiring — ko'chirish taklifi chiqadi. O'qituvchilar parolini qayta o'rnating.
+- Parolni unutsangiz: Render → Environment: `ADMIN_PASSWORD` ni yangilab, `RESET_ADMIN=1` qo'shing, qayta deploy qiling, keyin `RESET_ADMIN` ni o'chiring.
+- Kunlik zaxira nusxalar (14 kun): administrator sifatida kirib, `/api/backups` ni oching; yuklab olish: `/api/backups/2026-10-08`.
+
+## Mahalliy sinov
+```
+cp .env.example .env   # yoki o'zgaruvchilarni qo'lda bering
+ADMIN_USER=admin ADMIN_PASSWORD=parol1234 npm start
+npm test
+```
+
+## Ota-onalar paneli, umumiy chat va yangiliklar
+
+- **Ota-ona akkaunti:** administrator *O‘quvchilar → tahrirlash* oynasida bitta “Kirish logini” va ikkita parol (“O‘quvchi paroli”, “Ota-ona paroli”) kiritadi. Login o‘quvchi va ota-ona uchun bir xil, parollar har xil bo‘lishi shart — tizim kirishda parol bo‘yicha kim ekanini aniqlaydi. Ota-ona shu bilan kirib, farzandining natijalari, baholari, davomati, dars jadvali va to‘lovlarini ko‘radi.
+- **Umumiy chat:** ota-onalar va administrator uchun bitta umumiy chat (ota-ona panelida “Chat”, admin panelida “Ota-onalar chati”). O‘qituvchilar va o‘quvchilar ko‘rmaydi. Administrator “Yozishni to‘xtatish” tugmasi bilan ota-onalar yozishini vaqtincha to‘xtata oladi (ular o‘qiy oladi, admin yozaveradi) va xabarni o‘chira oladi.
+- **Yangiliklar:** admin panelidagi “Yangiliklar” bo‘limida matn, rasm (8 MB gacha, avtomatik kichraytiriladi) va video (MP4/MOV/WEBM, 40 MB gacha) bilan yangilik e‘lon qiladi. U ota-ona va o‘quvchi panelidagi yuqori o‘ng burchakdagi qo‘ng‘iroqchada ko‘rinadi, yangi bo‘lsa qizil son chiqadi. Fayllar bazada (Neon) saqlanadi; Render’da `DATABASE_URL` bo‘lishi shart, aks holda yuklangan fayllar qayta ishga tushganda yo‘qoladi.
+- Onlayn to‘lov (Payme/Click) olib tashlangan: to‘lovlarni administrator “To‘lovlar” bo‘limida belgilaydi. `payments.js` endi kerak emas.

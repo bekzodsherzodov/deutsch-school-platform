@@ -1,0 +1,20 @@
+{
+  "name": "deutsch-school",
+  "version": "1.0.0",
+  "description": "Deutsch School boshqaruv paneli — frontend + backend",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "web:dev": "npm --prefix web run dev",
+    "build": "npm --prefix web install --include=dev && npm --prefix web run build",
+    "test": "node test/smoke.js && node test/student.js && node test/shared-login.js && node test/dm.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}

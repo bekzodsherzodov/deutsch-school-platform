@@ -1,0 +1,1442 @@
+'use strict';
+/* ============================================================
+   Deutsch School — backend
+   - Kutubxonasiz HTTP server (faqat `pg` Postgres uchun)
+   - Ma'lumot: DATABASE_URL bo'lsa Postgres, aks holda data/db.json
+   - Login: scrypt bilan xeshlangan parollar, imzolangan HttpOnly cookie
+   ============================================================ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const zlib = require('zlib');
+
+const PORT = Number(process.env.PORT) || 3000;
+const PROD = process.env.NODE_ENV === 'production';
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const PUBLIC_DIR = require('fs').existsSync(path.join(__dirname, 'web', 'dist'))
+  ? path.join(__dirname, 'web', 'dist')
+  : path.join(__dirname, 'public');
+const MAX_BODY = 12 * 1024 * 1024; // 12 MB (rasm/zaxira uchun)
+const SESSION_DAYS = 30;
+
+/* ---------------- yordamchilar ---------------- */
+
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+const BAD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const clone = v => JSON.parse(JSON.stringify(v));
+
+let chain = Promise.resolve();
+const serial = fn => {
+  const p = chain.then(() => fn());
+  chain = p.catch(() => {});
+  return p;
+};
+
+/* ---------------- saqlash (storage) ---------------- */
+
+async function createStore() {
+  const url = process.env.DATABASE_URL;
+  if (url) {
+    const { Pool } = require('pg');
+    const local = /@(localhost|127\.0\.0\.1)/.test(url);
+    const noSsl = local || /sslmode=disable/.test(url);
+    const pool = new Pool({
+      connectionString: url,
+      ssl: noSsl ? false : { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 15000
+    });
+    pool.on('error', e => log('pg pool xatosi:', e.message));
+    await pool.query(
+      'create table if not exists kv(key text primary key, value jsonb not null, updated_at timestamptz not null default now())'
+    );
+    await pool.query(
+      'create table if not exists media(id text primary key, mime text not null, size integer not null, data bytea not null, created_at timestamptz not null default now())'
+    );
+    return {
+      kind: 'postgres',
+      async get(k) {
+        const r = await pool.query('select value from kv where key=$1', [k]);
+        return r.rows[0] ? r.rows[0].value : null;
+      },
+      async set(k, v) {
+        await pool.query(
+          'insert into kv(key,value,updated_at) values($1,$2::jsonb,now()) on conflict (key) do update set value=excluded.value, updated_at=now()',
+          [k, JSON.stringify(v)]
+        );
+      },
+      async del(k) {
+        await pool.query('delete from kv where key=$1', [k]);
+      },
+      async keys(prefix) {
+        const r = await pool.query('select key from kv where key like $1 order by key', [prefix + '%']);
+        return r.rows.map(x => x.key);
+      },
+      async putMedia(id, mime, buf) {
+        await pool.query('insert into media(id,mime,size,data) values($1,$2,$3,$4) on conflict (id) do nothing', [id, mime, buf.length, buf]);
+      },
+      async mediaMeta(id) {
+        const r = await pool.query('select mime,size from media where id=$1', [id]);
+        return r.rows[0] ? { mime: r.rows[0].mime, size: r.rows[0].size } : null;
+      },
+      async mediaRange(id, start, end) {
+        const r = await pool.query('select substring(data from $2::int for $3::int) as d from media where id=$1', [id, start + 1, end - start + 1]);
+        return r.rows[0] ? r.rows[0].d : Buffer.alloc(0);
+      },
+      async delMedia(id) {
+        await pool.query('delete from media where id=$1', [id]);
+      },
+      async mediaTotal() {
+        const r = await pool.query('select coalesce(sum(size),0)::bigint as n from media');
+        return Number(r.rows[0].n);
+      },
+      async close() {
+        await pool.end();
+      }
+    };
+  }
+
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const file = path.join(DATA_DIR, 'db.json');
+  let mem = {};
+  try {
+    mem = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    mem = {};
+  }
+  const flush = () => {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(mem));
+    fs.renameSync(tmp, file);
+  };
+  return {
+    kind: 'file',
+    async get(k) {
+      return k in mem ? clone(mem[k]) : null;
+    },
+    async set(k, v) {
+      mem[k] = clone(v);
+      flush();
+    },
+    async del(k) {
+      delete mem[k];
+      flush();
+    },
+    async keys(prefix) {
+      return Object.keys(mem).filter(k => k.startsWith(prefix)).sort();
+    },
+    async putMedia(id, mime, buf) {
+      const dir = path.join(DATA_DIR, 'media');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, id + '.bin'), buf);
+      fs.writeFileSync(path.join(dir, id + '.json'), JSON.stringify({ mime, size: buf.length }));
+    },
+    async mediaMeta(id) {
+      try {
+        return JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'media', id + '.json'), 'utf8'));
+      } catch (e) {
+        return null;
+      }
+    },
+    async mediaRange(id, start, end) {
+      const fd = fs.openSync(path.join(DATA_DIR, 'media', id + '.bin'), 'r');
+      try {
+        const b = Buffer.alloc(end - start + 1);
+        const n = fs.readSync(fd, b, 0, b.length, start);
+        return b.subarray(0, n);
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+    async mediaTotal() {
+      let n = 0;
+      try {
+        for (const f of fs.readdirSync(path.join(DATA_DIR, 'media'))) {
+          if (f.endsWith('.json')) n += JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'media', f), 'utf8')).size || 0;
+        }
+      } catch (e) {}
+      return n;
+    },
+    async delMedia(id) {
+      for (const ext of ['.bin', '.json']) {
+        try {
+          fs.unlinkSync(path.join(DATA_DIR, 'media', id + ext));
+        } catch (e) {}
+      }
+    },
+    async close() {}
+  };
+}
+
+/* ---------------- parollar ---------------- */
+
+function scrypt(pw, salt) {
+  return new Promise((res, rej) =>
+    crypto.scrypt(pw, salt, 32, { N: 16384, r: 8, p: 1 }, (e, k) => (e ? rej(e) : res(k)))
+  );
+}
+async function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(String(pw), salt);
+  return 'scrypt$' + salt.toString('hex') + '$' + key.toString('hex');
+}
+async function verifyPassword(pw, stored) {
+  try {
+    const [alg, s, k] = String(stored || '').split('$');
+    if (alg !== 'scrypt' || !s || !k) return false;
+    const key = await scrypt(String(pw), Buffer.from(s, 'hex'));
+    const want = Buffer.from(k, 'hex');
+    return key.length === want.length && crypto.timingSafeEqual(key, want);
+  } catch (e) {
+    return false;
+  }
+}
+let DUMMY_HASH = null; // login vaqtini tenglashtirish uchun
+
+/* ---------------- holat (xotirada, har o'zgarishda saqlanadi) ---------------- */
+
+let store;
+let DOC = { rev: 0, data: {} }; // asosiy ma'lumot
+let ADMIN = null; // { user, hash, ver }
+let CREDS = {}; // id (o'qituvchi yoki o'quvchi) -> { login, hash, ver, t, role }
+let CHAT = { counter: 0, msgs: [] }; // umumiy chat (admin + o'qituvchilar)
+let GCHAT = { enabled: true, counter: 0, msgs: [], reads: {} }; // ota-onalar + administrator: bitta umumiy chat
+let DMS = { counter: 0, msgs: [], reads: {} }; // shaxsiy yozishmalar (administrator, o'qituvchi, ota-ona)
+let NEWS = { counter: 0, items: [], seen: {} }; // yangiliklar (admin yozadi, o'quvchi va ota-onalar ko'radi)
+const PENDING_MEDIA = new Map(); // yuklangan, lekin hali yangilikka biriktirilmagan fayllar
+let META = { secret: '' };
+
+const persistDoc = () => serial(() => store.set('doc', DOC));
+const persistAdmin = () => serial(() => store.set('admin', ADMIN));
+const persistCreds = () => serial(() => store.set('creds', CREDS));
+
+/* ---------------- sessiya ---------------- */
+
+const b64u = b => Buffer.from(b).toString('base64url');
+const sign = s => crypto.createHmac('sha256', META.secret).update(s).digest('base64url');
+
+function makeToken(who, ver, remember) {
+  const exp = Date.now() + (remember ? SESSION_DAYS : 1) * 86400000;
+  const body = b64u(JSON.stringify({ w: who, v: ver, e: exp }));
+  return body + '.' + sign(body);
+}
+function readToken(tok) {
+  if (!tok || typeof tok !== 'string') return null;
+  const [body, sig] = tok.split('.');
+  if (!body || !sig) return null;
+  const want = sign(body);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(want);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!p || p.e < Date.now()) return null;
+    return p;
+  } catch (e) {
+    return null;
+  }
+}
+function parseCookies(h) {
+  const out = {};
+  String(h || '')
+    .split(';')
+    .forEach(x => {
+      const i = x.indexOf('=');
+      if (i > 0) out[x.slice(0, i).trim()] = decodeURIComponent(x.slice(i + 1).trim());
+    });
+  return out;
+}
+function isHttps(req) {
+  return req.headers['x-forwarded-proto'] === 'https' || !!req.socket.encrypted;
+}
+function setSessionCookie(req, res, who, ver, remember) {
+  const parts = ['ds_sid=' + makeToken(who, ver, remember), 'Path=/', 'HttpOnly', 'SameSite=Lax'];
+  if (remember) parts.push('Max-Age=' + SESSION_DAYS * 86400);
+  if (PROD || isHttps(req)) parts.push('Secure');
+  addHeader(res, 'Set-Cookie', parts.join('; '));
+}
+function clearSessionCookie(req, res) {
+  const parts = ['ds_sid=', 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+  if (PROD || isHttps(req)) parts.push('Secure');
+  addHeader(res, 'Set-Cookie', parts.join('; '));
+}
+function addHeader(res, k, v) {
+  const cur = res.getHeader(k);
+  if (!cur) res.setHeader(k, v);
+  else res.setHeader(k, [].concat(cur, v));
+}
+
+/** Joriy foydalanuvchi: { role:'admin' } | { role:'teacher'|'student', id } | null */
+function sessionOf(req) {
+  const tok = parseCookies(req.headers.cookie).ds_sid;
+  const p = readToken(tok);
+  if (!p) return null;
+  if (p.w === 'admin') {
+    if (!ADMIN || p.v !== ADMIN.ver) return null;
+    return { role: 'admin', id: 'admin' };
+  }
+  const c = CREDS[p.w];
+  if (!c || c.ver !== p.v) return null;
+  const role = c.role === 'student' ? 'student' : c.role === 'parent' ? 'parent' : 'teacher';
+  return { role, id: p.w };
+}
+
+/* ---------------- login urinishlarini cheklash ---------------- */
+
+const attempts = new Map();
+function clientIp(req) {
+  const xf = req.headers['x-forwarded-for'];
+  if (xf) return String(xf).split(',')[0].trim();
+  return req.socket.remoteAddress || '?';
+}
+function tooMany(key) {
+  const now = Date.now();
+  const a = attempts.get(key);
+  if (!a || a.reset < now) return false;
+  return a.n >= 8;
+}
+function addAttempt(key) {
+  const now = Date.now();
+  const a = attempts.get(key);
+  if (!a || a.reset < now) attempts.set(key, { n: 1, reset: now + 15 * 60000 });
+  else a.n++;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of attempts) if (v.reset < now) attempts.delete(k);
+}, 10 * 60000).unref();
+
+const chatHits = new Map();
+function chatRate(key) {
+  const now = Date.now();
+  const arr = (chatHits.get(key) || []).filter(t => now - t < 10000);
+  arr.push(now);
+  chatHits.set(key, arr);
+  return arr.length > 15;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, m] of PENDING_MEDIA) {
+    if (now - m.t > 3600000) {
+      PENDING_MEDIA.delete(id);
+      if (store) store.delMedia(id).catch(() => {});
+    }
+  }
+}, 600000).unref();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of chatHits) if (!v.some(t => now - t < 10000)) chatHits.delete(k);
+}, 60000).unref();
+
+/* ---------------- HTTP yordamchilari ---------------- */
+
+function send(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store'
+  });
+  res.end(body);
+}
+const fail = (res, code, msg) => send(res, code, { error: msg });
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(Object.assign(new Error('Hajm juda katta'), { code: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch (e) {
+        reject(Object.assign(new Error('JSON noto‘g‘ri'), { code: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sameOrigin(req) {
+  const o = req.headers.origin;
+  if (!o) return true;
+  try {
+    return new URL(o).host === req.headers.host;
+  } catch (e) {
+    return false;
+  }
+}
+
+function securityHeaders(req, res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+      "font-src https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+  );
+  if (PROD || isHttps(req)) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+}
+
+/* ---------------- ma'lumotga ruxsat va tozalash ---------------- */
+
+const TEACHER_KEYS = new Set(['weekly', 'weeklyMeta', 'weeklyBy', 'attendance', 'grades', 'satRes']);
+// grades va satRes kalitida fan NOMI turadi (masalan "Algebra"), boshqalarida fan ID si
+const NAME_KEYED = new Set(['grades', 'satRes']);
+const FIXED_SUBS = ['Matem', 'Algebra', 'Ingliz tili', 'Fizika', 'Nemis tili', 'IT', 'Biologiya', 'Kimyo'];
+const GEN_SUBJECT = '__general__';
+
+function canonSub(n) {
+  const l = String(n || '').toLowerCase().trim();
+  return FIXED_SUBS.find(f => l.startsWith(f.toLowerCase())) || String(n || '');
+}
+
+function teacherLessons(data, tid) {
+  return (data.timetable || []).filter(x => x && x.teacherId === tid && x.subjectId && x.groupId);
+}
+function teacherMayWrite(data, tid, p, op) {
+  if (!TEACHER_KEYS.has(p[0])) return false;
+  if (p.length < 2) {
+    // faqat bo'sh bo'limni birinchi marta yaratishga ruxsat (mavjudini almashtirib bo'lmaydi)
+    const empty = op && op.v && typeof op.v === 'object' && !Array.isArray(op.v) && Object.keys(op.v).length === 0;
+    return NAME_KEYED.has(p[0]) && !!empty && data[p[0]] === undefined;
+  }
+  const parts = String(p[1]).split('|');
+  const gid = parts[0];
+  const lessons = teacherLessons(data, tid).filter(x => x.groupId === gid);
+  if (!lessons.length) return false;
+  if (NAME_KEYED.has(p[0])) {
+    const want = canonSub(String(parts[1] || '').replace(/#\d+$/, ''));
+    return lessons.some(x => {
+      const sb = (data.subjects || []).find(z => z && z.id === x.subjectId);
+      return sb && canonSub(sb.name) === want;
+    });
+  }
+  if (p[0] !== 'attendance' && parts[1] && parts[1] !== GEN_SUBJECT) {
+    if (!lessons.some(x => x.subjectId === parts[1])) return false;
+  }
+  return true;
+}
+
+/** Mijozga beriladigan ko'rinish (parol xeshlari hech qachon chiqmaydi) */
+function viewFor(sess) {
+  const d = clone(DOC.data);
+  if (Array.isArray(d.teachers)) {
+    d.teachers = d.teachers.map(t => {
+      const c = CREDS[t.id];
+      const o = { ...t };
+      delete o.pwHash;
+      o.pwHash = c ? 'set' : '';
+      if (c) o.login = c.login;
+      return o;
+    });
+  }
+  if (Array.isArray(d.students)) {
+    d.students = d.students.map(st => {
+      const o = { ...st };
+      delete o.pwHash;
+      delete o.login;
+      delete o.pLogin;
+      delete o.pSet;
+      const c = CREDS[st.id];
+      if (sess.role === 'admin') {
+        o.pwHash = c && c.role === 'student' ? 'set' : '';
+        if (c && c.role === 'student') o.login = c.login;
+        const pc = CREDS['p:' + st.id];
+        o.pSet = pc && pc.role === 'parent' ? 'set' : '';
+        if (pc && pc.role === 'parent') o.pLogin = pc.login;
+      }
+      return o;
+    });
+  }
+  if (sess.role === 'teacher') {
+    delete d.payments;
+    delete d.studentDeleteLog;
+    delete d.subjectDeleteLog;
+    delete d.teacherDeleteLog;
+    delete d.groupDeleteLog;
+    if (d.profile) d.profile = { name: d.profile.name, photo: '' };
+  }
+  return d;
+}
+
+function applyOps(data, ops, sess) {
+  if (!Array.isArray(ops) || ops.length > 20000) throw httpErr(400, 'Noto‘g‘ri so‘rov');
+  for (const op of ops) {
+    const p = op && op.p;
+    if (!Array.isArray(p) || p.length < 1 || p.length > 8) throw httpErr(400, 'Noto‘g‘ri yo‘l');
+    for (const seg of p) {
+      if (typeof seg !== 'string' || BAD_KEYS.has(seg) || seg.length > 300) throw httpErr(400, 'Noto‘g‘ri kalit');
+    }
+    if (sess.role === 'teacher' && !teacherMayWrite(data, sess.id, p, op)) {
+      throw httpErr(403, 'Bu o‘zgarishga ruxsat yo‘q');
+    }
+  }
+  for (const op of ops) {
+    const p = op.p;
+    let cur = data;
+    for (let i = 0; i < p.length - 1; i++) {
+      if (!isObj(cur[p[i]])) {
+        if (op.d) {
+          cur = null;
+          break;
+        }
+        cur[p[i]] = {};
+      }
+      cur = cur[p[i]];
+    }
+    if (!cur) continue;
+    const last = p[p.length - 1];
+    if (op.d) delete cur[last];
+    else cur[last] = op.v === undefined ? null : op.v;
+  }
+}
+
+function httpErr(code, msg) {
+  return Object.assign(new Error(msg), { code });
+}
+
+/** teachers[] va students[] o'zgarganda login ma'lumotlarini moslash */
+function syncCreds() {
+  let changed = false;
+  const tList = Array.isArray(DOC.data.teachers) ? DOC.data.teachers.filter(isObj) : [];
+  const sList = Array.isArray(DOC.data.students) ? DOC.data.students.filter(isObj) : [];
+  const byId = { teacher: new Map(tList.map(t => [t.id, t])), student: new Map(sList.map(x => [x.id, x])) };
+  const taken = new Set();
+  if (ADMIN) taken.add(ADMIN.user.toLowerCase());
+  for (const [id, c] of Object.entries(CREDS)) {
+    if (c.role === 'parent') {
+      // ota-ona akkaunti o'quvchiga bog'langan; o'quvchi o'chsa, akkaunt ham o'chadi
+      if (!byId.student.has(id.slice(2)) && Date.now() - (c.t || 0) > 120000) {
+        delete CREDS[id];
+        changed = true;
+      }
+      continue;
+    }
+    const t = byId[c.role === 'student' ? 'student' : 'teacher'].get(id);
+    if (!t) {
+      if (Date.now() - (c.t || 0) > 120000) {
+        delete CREDS[id];
+        changed = true;
+      }
+      continue;
+    }
+    const login = String(t.login || '').trim();
+    if (!login) {
+      delete CREDS[id];
+      changed = true;
+      continue;
+    }
+    if (login.toLowerCase() !== c.login.toLowerCase()) {
+      const clash =
+        taken.has(login.toLowerCase()) ||
+        Object.entries(CREDS).some(([o, x]) => o !== id && o !== 'p:' + id && x.login.toLowerCase() === login.toLowerCase());
+      if (clash) throw httpErr(409, 'Bu login band');
+      c.login = login;
+      c.ver = (c.ver || 0) + 1;
+      changed = true;
+    }
+  }
+  // doimiy xesh maydonlarini hujjatdan olib tashlash
+  for (const t of tList) if ('pwHash' in t) delete t.pwHash;
+  for (const x of sList) {
+    if ('pwHash' in x) delete x.pwHash;
+    if ('pLogin' in x) delete x.pLogin;
+    if ('pSet' in x) delete x.pSet;
+  }
+  return changed;
+}
+
+/* ---------------- kunlik zaxira ---------------- */
+
+async function dailyBackup() {
+  try {
+    const key = 'backup:' + new Date().toISOString().slice(0, 10);
+    const have = await store.get(key);
+    if (!have && DOC.rev > 0) {
+      await store.set(key, { rev: DOC.rev, data: DOC.data });
+      const keys = await store.keys('backup:');
+      const old = keys.slice(0, Math.max(0, keys.length - 14));
+      for (const k of old) await store.del(k);
+    }
+  } catch (e) {
+    log('zaxira xatosi:', e.message);
+  }
+}
+
+const buildStudentView = require('./student');
+
+
+/* ---------------- shaxsiy yozishmalar (DM) + chat a'zolari ----------------
+   Qoida: administrator hamma bilan yozisha oladi; o‘qituvchilar o‘zaro va administrator bilan;
+   ota-onalar faqat administrator bilan (boshqa ota-onalar ma’lumoti ko‘rinmaydi). */
+
+const credRole = c => (c.role === 'student' ? 'student' : c.role === 'parent' ? 'parent' : 'teacher');
+
+function personOf(id) {
+  if (id === 'admin') return { id, name: (DOC.data.profile && DOC.data.profile.name) || (ADMIN && ADMIN.user) || 'Administrator', role: 'admin', sub: '' };
+  const c = CREDS[id];
+  if (!c) return null;
+  const role = credRole(c);
+  if (role === 'student') return null;
+  if (role === 'parent') {
+    const st = (DOC.data.students || []).find(x => x && x.id === id.slice(2));
+    if (!st) return null;
+    const g = (DOC.data.groups || []).find(x => x && x.id === st.groupId);
+    return { id, name: ((st.first || '') + ' ' + (st.last || '')).trim() + ' ota-onasi', role, sub: g ? String(g.name || '') : '' };
+  }
+  const t = (DOC.data.teachers || []).find(x => x && x.id === id);
+  return t ? { id, name: String(t.name || c.login || 'O‘qituvchi'), role, sub: '' } : null;
+}
+
+const canDM = (a, b) => !!a && !!b && a.id !== b.id && (a.role === 'admin' || b.role === 'admin' || (a.role === 'teacher' && b.role === 'teacher'));
+
+async function dmApi(req, res, url, route, sess) {
+  if (sess.role !== 'admin' && sess.role !== 'teacher' && sess.role !== 'parent') return fail(res, 403, 'Bu bo‘limga ruxsat yo‘q');
+  const acc = sess.id;
+  const me = personOf(acc);
+  if (!me) return fail(res, 403, 'Bu bo‘limga ruxsat yo‘q');
+  const pairOf = peer => [acc, peer].sort().join('|');
+  const readOf = peer => (DMS.reads[acc] && DMS.reads[acc][peer]) || 0;
+  const unreadFrom = peer => DMS.msgs.filter(m => m.to === acc && m.from === peer && !m.x && m.seq > readOf(peer)).length;
+  const save = () => store.set('dm', DMS);
+  const view = m => ({ id: m.id, seq: m.seq, ver: m.ver, text: m.x ? '' : m.text, ts: m.ts, x: !!m.x, me: m.from === acc });
+
+  if (route === 'GET /api/dm/unread') {
+    const n = DMS.msgs.filter(m => m.to === acc && !m.x && m.seq > ((DMS.reads[acc] && DMS.reads[acc][m.from]) || 0)).length;
+    return send(res, 200, { unread: n });
+  }
+
+  if (route === 'GET /api/dm/members') {
+    const room = url.searchParams.get('room');
+    let ids = [];
+    if (room === 'staff') {
+      if (me.role === 'parent') return fail(res, 403, 'Ruxsat yo‘q');
+      ids = ['admin', ...Object.keys(CREDS).filter(id => credRole(CREDS[id]) === 'teacher')];
+    } else if (room === 'parents') {
+      if (me.role === 'teacher') return fail(res, 403, 'Ruxsat yo‘q');
+      // ota-ona boshqa ota-onalarni ko‘rmaydi: faqat administrator
+      ids = me.role === 'admin' ? ['admin', ...Object.keys(CREDS).filter(id => credRole(CREDS[id]) === 'parent')] : ['admin'];
+    } else return fail(res, 400, 'Noto‘g‘ri chat');
+    const members = ids.map(personOf).filter(Boolean).map(p => {
+      const pair = pairOf(p.id);
+      let last = null;
+      for (let i = DMS.msgs.length - 1; i >= 0; i--) {
+        const m = DMS.msgs[i];
+        if (m.pair === pair && !m.x) { last = { text: m.text.slice(0, 80), ts: m.ts, mine: m.from === acc }; break; }
+      }
+      return { ...p, me: p.id === acc, canDM: canDM(me, p), unread: unreadFrom(p.id), last };
+    });
+    return send(res, 200, { members });
+  }
+
+  if (route === 'GET /api/dm') {
+    const peer = personOf(String(url.searchParams.get('peer') || ''));
+    if (!canDM(me, peer)) return fail(res, 403, 'Bu foydalanuvchiga yozib bo‘lmaydi');
+    const since = Number(url.searchParams.get('since')) || 0;
+    const pair = pairOf(peer.id);
+    const mine = DMS.msgs.filter(m => m.pair === pair);
+    const msgs = mine.filter(m => m.ver > since).map(view);
+    const top = mine.reduce((a, m) => Math.max(a, m.seq), 0);
+    if (top > readOf(peer.id)) {
+      await serial(async () => {
+        DMS.reads[acc] = DMS.reads[acc] || {};
+        DMS.reads[acc][peer.id] = top;
+        await save();
+      });
+    }
+    return send(res, 200, { msgs, last: DMS.counter, peer });
+  }
+
+  if (route === 'POST /api/dm') {
+    const b = await readBody(req);
+    const peer = personOf(String(b.peer || ''));
+    if (!canDM(me, peer)) return fail(res, 403, 'Bu foydalanuvchiga yozib bo‘lmaydi');
+    const text = String(b.text || '').trim().slice(0, 2000);
+    if (!text) return fail(res, 400, 'Xabar bo‘sh');
+    if (chatRate(clientIp(req) + '|dm|' + acc)) return fail(res, 429, 'Juda tez yozyapsiz. Biroz kuting');
+    const msg = await serial(async () => {
+      const n = ++DMS.counter;
+      const m = { id: crypto.randomBytes(8).toString('hex'), seq: n, ver: n, pair: pairOf(peer.id), from: acc, to: peer.id, text, ts: Date.now(), x: false };
+      DMS.msgs.push(m);
+      if (DMS.msgs.length > 5000) DMS.msgs.splice(0, DMS.msgs.length - 5000);
+      DMS.reads[acc] = DMS.reads[acc] || {};
+      DMS.reads[acc][peer.id] = n;
+      await save();
+      return m;
+    });
+    return send(res, 200, { ok: true, msg: view(msg) });
+  }
+
+  if (route === 'POST /api/dm/delete') {
+    const b = await readBody(req);
+    await serial(async () => {
+      const m = DMS.msgs.find(x => x.id === String(b.id || ''));
+      if (!m || m.x || m.from !== acc) return; // faqat o‘z xabarini o‘chiradi
+      m.x = true;
+      m.text = '';
+      m.ver = ++DMS.counter;
+      await save();
+    });
+    return send(res, 200, { ok: true });
+  }
+
+  return fail(res, 404, 'Topilmadi');
+}
+
+/* ---------------- ota-onalar + administrator: bitta umumiy chat ---------------- */
+
+const accOf = sess => (sess.role === 'admin' ? 'admin' : sess.id);
+
+async function gchatApi(req, res, url, route, sess) {
+  if (sess.role !== 'admin' && sess.role !== 'parent') return fail(res, 403, 'Bu bo‘lim faqat administrator va ota-onalar uchun');
+  const acc = accOf(sess);
+  const admin = sess.role === 'admin';
+  const view = m => ({ id: m.id, seq: m.seq, ver: m.ver, role: m.role, name: m.name, text: m.x ? '' : m.text, ts: m.ts, x: !!m.x, me: m.uid === acc });
+  const unread = () => GCHAT.msgs.filter(m => !m.x && m.uid !== acc && m.seq > (GCHAT.reads[acc] || 0)).length;
+  const save = () => store.set('gchat', GCHAT);
+
+  if (route === 'GET /api/pchat/unread') return send(res, 200, { enabled: GCHAT.enabled, unread: unread() });
+
+  if (route === 'GET /api/pchat') {
+    const since = Number(url.searchParams.get('since')) || 0;
+    const msgs = GCHAT.msgs.filter(m => m.ver > since).map(view);
+    const peek = url.searchParams.get('peek') === '1';
+    const before = unread();
+    if (!peek && (GCHAT.reads[acc] || 0) !== GCHAT.counter) {
+      await serial(async () => {
+        GCHAT.reads[acc] = GCHAT.counter;
+        await save();
+      });
+    }
+    return send(res, 200, { msgs, last: GCHAT.counter, enabled: GCHAT.enabled, unread: peek ? before : 0 });
+  }
+
+  if (route === 'POST /api/pchat') {
+    const b = await readBody(req);
+    const text = String(b.text || '').trim().slice(0, 2000);
+    if (!text) return fail(res, 400, 'Xabar bo‘sh');
+    if (!admin && !GCHAT.enabled) return fail(res, 403, 'Chat vaqtincha to‘xtatilgan');
+    if (chatRate(clientIp(req) + '|pchat|' + acc)) return fail(res, 429, 'Juda tez yozyapsiz. Biroz kuting');
+    let name = 'Administrator';
+    if (!admin) {
+      const st = (DOC.data.students || []).find(x => x && x.id === sess.id.slice(2));
+      name = st ? ((st.first || '') + ' ' + (st.last || '')).trim() : 'Ota-ona';
+    }
+    const msg = await serial(async () => {
+      const n = ++GCHAT.counter;
+      const m = { id: crypto.randomBytes(8).toString('hex'), seq: n, ver: n, uid: acc, role: admin ? 'admin' : 'parent', name, text, ts: Date.now(), x: false };
+      GCHAT.msgs.push(m);
+      if (GCHAT.msgs.length > 500) GCHAT.msgs.splice(0, GCHAT.msgs.length - 500);
+      GCHAT.reads[acc] = n;
+      await save();
+      return m;
+    });
+    return send(res, 200, { ok: true, msg: view(msg) });
+  }
+
+  if (route === 'POST /api/pchat/delete') {
+    if (!admin) return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    await serial(async () => {
+      const m = GCHAT.msgs.find(x => x.id === String(b.id || ''));
+      if (!m || m.x) return;
+      m.x = true;
+      m.text = '';
+      m.ver = ++GCHAT.counter;
+      await save();
+    });
+    return send(res, 200, { ok: true });
+  }
+
+  /* chatni vaqtincha to'xtatish / yoqish (ota-onalar yoza olmaydi, admin yozadi) */
+  if (route === 'POST /api/pchat/lock') {
+    if (!admin) return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    await serial(async () => {
+      GCHAT.enabled = b.locked !== true;
+      await save();
+    });
+    return send(res, 200, { ok: true, enabled: GCHAT.enabled });
+  }
+
+  return fail(res, 404, 'Topilmadi');
+}
+
+/* ---------------- yangiliklar (rasm / video / matn) ---------------- */
+
+const NEWS_IMG = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const NEWS_VID = new Set(['video/mp4', 'video/webm', 'video/quicktime']);
+const MAX_IMG = 8 * 1024 * 1024;
+const MAX_VID = 40 * 1024 * 1024;
+const MEDIA_LIMIT = (Number(process.env.MEDIA_LIMIT_MB) || 400) * 1024 * 1024; // jami fayllar hajmi (bepul baza to'lib qolmasligi uchun)
+const MEDIA_ID = /^[a-f0-9]{24}$/;
+
+function readRaw(req, max) {
+  return new Promise((resolve, reject) => {
+    const len = Number(req.headers['content-length']);
+    if (len && len > max) {
+      req.resume();
+      return reject(Object.assign(new Error('Fayl juda katta'), { code: 413 }));
+    }
+    let size = 0;
+    const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > max) {
+        reject(Object.assign(new Error('Fayl juda katta'), { code: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+async function serveMedia(req, res, id) {
+  const meta = MEDIA_ID.test(id) ? await store.mediaMeta(id) : null;
+  if (!meta) return fail(res, 404, 'Fayl topilmadi');
+  const size = meta.size;
+  let start = 0;
+  let end = size - 1;
+  let code = 200;
+  const hdr = {
+    'Content-Type': meta.mime,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=86400',
+    'Content-Disposition': 'inline',
+    'X-Content-Type-Options': 'nosniff'
+  };
+  const r = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ''));
+  if (r && (r[1] !== '' || r[2] !== '')) {
+    if (r[1] === '') start = Math.max(0, size - Number(r[2]));
+    else {
+      start = Number(r[1]);
+      if (r[2] !== '') end = Math.min(end, Number(r[2]));
+    }
+    if (start > end || start >= size) {
+      res.writeHead(416, { 'Content-Range': 'bytes */' + size });
+      return res.end();
+    }
+    end = Math.min(end, start + 4 * 1024 * 1024 - 1); // bo'laklab beramiz
+    code = 206;
+    hdr['Content-Range'] = 'bytes ' + start + '-' + end + '/' + size;
+  }
+  hdr['Content-Length'] = end - start + 1;
+  res.writeHead(code, hdr);
+  if (req.method === 'HEAD') return res.end();
+  res.end(await store.mediaRange(id, start, end));
+}
+
+async function newsApi(req, res, url, route, sess) {
+  if (sess.role === 'teacher') return fail(res, 403, 'Bu bo‘limga ruxsat yo‘q');
+  const admin = sess.role === 'admin';
+  const acc = accOf(sess);
+  const view = it => ({
+    id: it.id,
+    seq: it.seq,
+    ts: it.ts,
+    title: it.title,
+    text: it.text,
+    pinned: !!it.pinned,
+    edited: it.edited || 0,
+    media: it.media.map(m => ({ id: m.id, kind: m.kind, mime: m.mime, size: m.size, url: '/api/news/media/' + m.id }))
+  });
+  const save = () => store.set('news', NEWS);
+
+  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname.startsWith('/api/news/media/')) {
+    return serveMedia(req, res, url.pathname.slice('/api/news/media/'.length));
+  }
+
+  if (route === 'GET /api/news') {
+    const items = NEWS.items.slice().sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.seq - a.seq).slice(0, 100).map(view);
+    const out = { items, last: NEWS.counter, unread: newsUnread(acc), seen: NEWS.seen[acc] || 0 };
+    if (admin) out.usage = { used: await store.mediaTotal(), limit: MEDIA_LIMIT };
+    return send(res, 200, out);
+  }
+
+  if (route === 'POST /api/news/seen') {
+    if ((NEWS.seen[acc] || 0) !== NEWS.counter) {
+      await serial(async () => {
+        NEWS.seen[acc] = NEWS.counter;
+        await save();
+      });
+    }
+    return send(res, 200, { ok: true });
+  }
+
+  if (!admin) return fail(res, 403, 'Faqat administrator');
+
+  if (route === 'POST /api/news/media') {
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const isImg = NEWS_IMG.has(mime);
+    if (!isImg && !NEWS_VID.has(mime)) return fail(res, 415, 'Faqat rasm (JPG, PNG, WEBP, GIF) yoki video (MP4, WEBM, MOV)');
+    const used = await store.mediaTotal();
+    const declared = Number(req.headers['content-length']) || 0;
+    if (declared > (isImg ? MAX_IMG : MAX_VID)) {
+      req.resume();
+      return fail(res, 413, 'Fayl juda katta (rasm 8 MB, video 40 MB gacha)');
+    }
+    if (used + declared > MEDIA_LIMIT) {
+      req.resume();
+      return fail(res, 507, 'Fayllar uchun xotira to‘ldi. Eski yangilik yoki videolarni o‘chiring');
+    }
+    const buf = await readRaw(req, isImg ? MAX_IMG : MAX_VID);
+    if (!buf.length) return fail(res, 400, 'Fayl bo‘sh');
+    if (used + buf.length > MEDIA_LIMIT) return fail(res, 507, 'Fayllar uchun xotira to‘ldi. Eski yangilik yoki videolarni o‘chiring');
+    const id = crypto.randomBytes(12).toString('hex');
+    await store.putMedia(id, mime, buf);
+    const info = { id, kind: isImg ? 'image' : 'video', mime, size: buf.length };
+    PENDING_MEDIA.set(id, { ...info, t: Date.now() });
+    return send(res, 200, { ...info, url: '/api/news/media/' + id });
+  }
+
+  if (route === 'POST /api/news/media-delete') {
+    const b = await readBody(req);
+    const id = String(b.id || '');
+    if (PENDING_MEDIA.has(id)) {
+      PENDING_MEDIA.delete(id);
+      await store.delMedia(id);
+    }
+    return send(res, 200, { ok: true });
+  }
+
+  if (route === 'POST /api/news') {
+    const b = await readBody(req);
+    const title = String(b.title || '').trim().slice(0, 150);
+    const text = String(b.text || '').trim().slice(0, 5000);
+    const ids = Array.isArray(b.media) ? b.media.map(String).slice(0, 10) : [];
+    const media = [];
+    for (const id of ids) {
+      const m = PENDING_MEDIA.get(id);
+      if (!m) return fail(res, 400, 'Fayl topilmadi. Qayta yuklang');
+      media.push({ id: m.id, kind: m.kind, mime: m.mime, size: m.size });
+    }
+    if (!text && !title && !media.length) return fail(res, 400, 'Matn yoki rasm/video kiriting');
+    const item = await serial(async () => {
+      const n = ++NEWS.counter;
+      const it = { id: crypto.randomBytes(8).toString('hex'), seq: n, ts: Date.now(), title, text, media };
+      NEWS.items.push(it);
+      for (const m of media) PENDING_MEDIA.delete(m.id);
+      await save();
+      return it;
+    });
+    return send(res, 200, { ok: true, item: view(item) });
+  }
+
+  if (route === 'POST /api/news/update') {
+    const b = await readBody(req);
+    const removed = [];
+    const out = await serial(async () => {
+      const it = NEWS.items.find(x => x.id === String(b.id || ''));
+      if (!it) return { code: 404, msg: 'Yangilik topilmadi' };
+      const title = typeof b.title === 'string' ? b.title.trim().slice(0, 150) : it.title;
+      const text = typeof b.text === 'string' ? b.text.trim().slice(0, 5000) : it.text;
+      const rm = new Set(Array.isArray(b.removeMedia) ? b.removeMedia.map(String) : []);
+      const keep = it.media.filter(m => !rm.has(m.id));
+      if (!title && !text && !keep.length) return { code: 400, msg: 'Matn yoki rasm/video qolishi kerak' };
+      const changed = title !== it.title || text !== it.text || keep.length !== it.media.length;
+      removed.push(...it.media.filter(m => rm.has(m.id)));
+      it.title = title;
+      it.text = text;
+      it.media = keep;
+      if (typeof b.pinned === 'boolean') it.pinned = b.pinned;
+      if (changed) it.edited = Date.now();
+      await save();
+      return { item: it };
+    });
+    if (out.code) return fail(res, out.code, out.msg);
+    for (const m of removed) await store.delMedia(m.id);
+    return send(res, 200, { ok: true, item: view(out.item) });
+  }
+
+  if (route === 'POST /api/news/delete') {
+    const b = await readBody(req);
+    const gone = await serial(async () => {
+      const i = NEWS.items.findIndex(x => x.id === String(b.id || ''));
+      if (i < 0) return null;
+      const [it] = NEWS.items.splice(i, 1);
+      await save();
+      return it;
+    });
+    if (gone) for (const m of gone.media) await store.delMedia(m.id);
+    return send(res, 200, { ok: true });
+  }
+
+  return fail(res, 404, 'Topilmadi');
+}
+const newsUnread = acc => NEWS.items.filter(i => i.seq > (NEWS.seen[acc] || 0)).length;
+
+/* ---------------- API ---------------- */
+
+async function api(req, res, url) {
+  const route = req.method + ' ' + url.pathname;
+
+  if (route === 'GET /api/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+    return res.end('ok');
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD' && !sameOrigin(req)) {
+    return fail(res, 403, 'Ruxsat etilmagan manba');
+  }
+
+  if (route === 'GET /api/status') {
+    return send(res, 200, { needsSetup: !ADMIN });
+  }
+
+  /* ---- birinchi administrator ---- */
+  if (route === 'POST /api/auth/setup') {
+    if (ADMIN) return fail(res, 409, 'Administrator allaqachon yaratilgan');
+    const b = await readBody(req);
+    const user = String(b.user || '').trim();
+    const pw = String(b.password || '');
+    if (!user || user.length > 60) return fail(res, 400, 'Login kiriting');
+    if (pw.length < 4) return fail(res, 400, 'Parol kamida 4 belgidan iborat bo‘lsin');
+    ADMIN = { user, hash: await hashPassword(pw), ver: 1 };
+    await persistAdmin();
+    setSessionCookie(req, res, 'admin', ADMIN.ver, true);
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- kirish ---- */
+  if (route === 'POST /api/auth/login') {
+    const b = await readBody(req);
+    const user = String(b.user || '').trim();
+    const pw = String(b.password || '');
+    const key = clientIp(req) + '|' + user.toLowerCase();
+    if (tooMany(key) || tooMany(clientIp(req) + '|*')) {
+      return fail(res, 429, 'Juda ko‘p urinish. 15 daqiqadan keyin qayta urinib ko‘ring');
+    }
+    if (!DUMMY_HASH) DUMMY_HASH = await hashPassword('dummy');
+    let who = null;
+    let ver = 0;
+
+    if (ADMIN && user.toLowerCase() === ADMIN.user.toLowerCase()) {
+      if (await verifyPassword(pw, ADMIN.hash)) {
+        who = 'admin';
+        ver = ADMIN.ver;
+      }
+    } else {
+      // o'quvchi va uning ota-onasi bir xil login ishlatishi mumkin — parol farqlaydi
+      const entries = Object.entries(CREDS).filter(([, c]) => c.login.toLowerCase() === user.toLowerCase());
+      if (entries.length) {
+        for (const entry of entries) {
+          if (await verifyPassword(pw, entry[1].hash)) {
+            who = entry[0];
+            ver = entry[1].ver;
+            break;
+          }
+        }
+      } else {
+        await verifyPassword(pw, DUMMY_HASH);
+      }
+    }
+
+    if (!who) {
+      addAttempt(key);
+      addAttempt(clientIp(req) + '|*');
+      return fail(res, 401, 'Login yoki parol noto‘g‘ri');
+    }
+    setSessionCookie(req, res, who, ver, !!b.remember);
+    const cr = who === 'admin' ? null : CREDS[who].role;
+    const role = who === 'admin' ? 'admin' : cr === 'student' ? 'student' : cr === 'parent' ? 'parent' : 'teacher';
+    return send(res, 200, { ok: true, role, id: who });
+  }
+
+  if (route === 'POST /api/auth/logout') {
+    clearSessionCookie(req, res);
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- bundan keyingilari faqat kirgan foydalanuvchilar uchun ---- */
+  const sess = sessionOf(req);
+  if (!sess) return fail(res, 401, 'Kirish talab qilinadi');
+
+  if (route === 'GET /api/session') {
+    return send(res, 200, {
+      role: sess.role,
+      id: sess.id,
+      adminUser: sess.role === 'admin' ? ADMIN.user : undefined
+    });
+  }
+
+  if (route === 'POST /api/auth/password') {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    if (!(await verifyPassword(String(b.old || ''), ADMIN.hash))) return fail(res, 400, 'Joriy parol noto‘g‘ri');
+    const nw = String(b.new || '');
+    if (nw.length < 4) return fail(res, 400, 'Yangi parol kamida 4 belgidan iborat bo‘lsin');
+    ADMIN.hash = await hashPassword(nw);
+    ADMIN.ver++;
+    await persistAdmin();
+    setSessionCookie(req, res, 'admin', ADMIN.ver, true);
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- ma'lumot ---- */
+  if (url.pathname.startsWith('/api/pchat')) return gchatApi(req, res, url, route, sess);
+  if (url.pathname.startsWith('/api/dm')) return dmApi(req, res, url, route, sess);
+  if (url.pathname.startsWith('/api/news')) return newsApi(req, res, url, route, sess);
+
+  /* ---- o'quvchi: faqat o'z paneli ---- */
+  if (sess.role === 'student') {
+    if (route === 'GET /api/me') {
+      const v = buildStudentView(DOC.data, sess.id);
+      if (!v) return fail(res, 404, 'O‘quvchi topilmadi');
+      v.news = { unread: newsUnread(sess.id) };
+      return send(res, 200, v);
+    }
+    if (route === 'POST /api/auth/password') return fail(res, 403, 'Faqat administrator');
+    return fail(res, 403, 'Bu bo‘limga ruxsat yo‘q');
+  }
+
+  /* ---- ota-ona: farzandining paneli + administrator bilan alohida chat ---- */
+  if (sess.role === 'parent') {
+    const sid = sess.id.slice(2);
+    if (route === 'GET /api/me') {
+      const v = buildStudentView(DOC.data, sid);
+      if (!v) return fail(res, 404, 'O‘quvchi topilmadi');
+      v.parent = true;
+      v.news = { unread: newsUnread(sess.id) };
+      v.chat = {
+        enabled: GCHAT.enabled,
+        unread: GCHAT.msgs.filter(m => !m.x && m.uid !== sess.id && m.seq > (GCHAT.reads[sess.id] || 0)).length
+      };
+      return send(res, 200, v);
+    }
+    if (route === 'POST /api/auth/password') return fail(res, 403, 'Faqat administrator');
+    return fail(res, 403, 'Bu bo‘limga ruxsat yo‘q');
+  }
+
+  if (url.pathname === '/api/me' || url.pathname.startsWith('/api/me/')) {
+    return fail(res, 403, 'Bu bo‘lim faqat o‘quvchilar uchun');
+  }
+
+  if (route === 'GET /api/data') {
+    const since = Number(url.searchParams.get('rev'));
+    if (since && since === DOC.rev) return send(res, 200, { rev: DOC.rev, unchanged: true });
+    return send(res, 200, { rev: DOC.rev, fresh: DOC.rev === 0, data: viewFor(sess) });
+  }
+
+  if (route === 'POST /api/data') {
+    const b = await readBody(req);
+    const result = await serial(async () => {
+      const draft = clone(DOC.data);
+      applyOps(draft, b.ops, sess);
+      const prevDoc = DOC.data;
+      const prevCreds = clone(CREDS);
+      DOC.data = draft;
+      let credsChanged = false;
+      try {
+        if (b.ops.some(o => o.p[0] === 'teachers' || o.p[0] === 'students')) credsChanged = syncCreds();
+      } catch (e) {
+        DOC.data = prevDoc;
+        CREDS = prevCreds;
+        throw e;
+      }
+      const prev = DOC.rev;
+      DOC.rev = prev + 1;
+      await store.set('doc', DOC);
+      if (credsChanged) await store.set('creds', CREDS);
+      return { rev: DOC.rev, prev };
+    });
+    dailyBackup();
+    return send(res, 200, result);
+  }
+
+  /* ---- o'qituvchi / o'quvchi login va paroli (faqat admin) ---- */
+  if (route === 'POST /api/credentials') {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    const isPar = !!b.parentOf;
+    const isStu = !isPar && !!b.studentId;
+    const role = isPar ? 'parent' : isStu ? 'student' : 'teacher';
+    const id = isPar ? 'p:' + String(b.parentOf || '') : String(isStu ? b.studentId : b.teacherId || '');
+    if (isPar && b.remove === true) {
+      if (CREDS[id] && CREDS[id].role === 'parent') {
+        delete CREDS[id];
+        await persistCreds();
+      }
+      return send(res, 200, { ok: true });
+    }
+    const login = String(b.login || '').trim();
+    const pw = String(b.password || '');
+    if (!id || id === 'p:' || BAD_KEYS.has(id) || BAD_KEYS.has(id.slice(2))) {
+      return fail(res, 400, isStu || isPar ? 'O‘quvchi aniqlanmadi' : 'O‘qituvchi aniqlanmadi');
+    }
+    if (!login || login.length > 60) return fail(res, 400, 'Login kiriting');
+    if (login.toLowerCase() === ADMIN.user.toLowerCase()) {
+      return fail(res, 409, 'Bu login administratorga tegishli. Boshqa login tanlang');
+    }
+    const pairId = isPar ? id.slice(2) : isStu ? 'p:' + id : '';
+    if (Object.entries(CREDS).some(([o, c]) => o !== id && o !== pairId && c.login.toLowerCase() === login.toLowerCase())) {
+      return fail(res, 409, isStu || isPar ? 'Bu login band. Boshqa login tanlang' : 'Bu login boshqa o‘qituvchida bor');
+    }
+    const cur = CREDS[id];
+    if (cur && (cur.role || 'teacher') !== role) return fail(res, 409, 'Bu identifikator band');
+    if (!cur && pw.length < 4) return fail(res, 400, 'Parol kamida 4 belgidan iborat bo‘lsin');
+    if (pw && pw.length < 4) return fail(res, 400, 'Parol kamida 4 belgidan iborat bo‘lsin');
+    const mate = pairId ? CREDS[pairId] : null;
+    if (pw && mate && mate.login.toLowerCase() === login.toLowerCase() && (await verifyPassword(pw, mate.hash))) {
+      return fail(res, 400, 'O‘quvchi va ota-ona parollari har xil bo‘lsin');
+    }
+    const hash = pw ? await hashPassword(pw) : cur.hash;
+    CREDS[id] = { login, hash, ver: (cur ? cur.ver : 0) + 1, t: Date.now(), role };
+    await persistCreds();
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- administrator parolini tasdiqlash (xavfli amallardan oldin) ---- */
+  if (route === 'POST /api/auth/verify') {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    const key = clientIp(req) + '|verify';
+    if (tooMany(key)) return fail(res, 429, 'Juda ko‘p urinish. 15 daqiqadan keyin qayta urinib ko‘ring');
+    if (!(await verifyPassword(String(b.password || ''), ADMIN.hash))) {
+      addAttempt(key);
+      return fail(res, 400, 'Parol noto‘g‘ri');
+    }
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- chat (administrator + o'qituvchilar) ---- */
+  if (route === 'GET /api/chat') {
+    const since = Number(url.searchParams.get('since')) || 0;
+    const msgs = CHAT.msgs.filter(m => m.ver > since);
+    return send(res, 200, { msgs, last: CHAT.counter });
+  }
+  if (route === 'POST /api/chat') {
+    const b = await readBody(req);
+    const text = String(b.text || '').trim().slice(0, 2000);
+    if (!text) return fail(res, 400, 'Xabar bo‘sh');
+    const key = clientIp(req) + '|chat|' + sess.id;
+    if (chatRate(key)) return fail(res, 429, 'Juda tez yozyapsiz. Biroz kuting');
+    let name = '';
+    if (sess.role === 'admin') name = (DOC.data.profile && DOC.data.profile.name) || ADMIN.user;
+    else {
+      const t = (DOC.data.teachers || []).find(x => x && x.id === sess.id);
+      name = (t && t.name) || (CREDS[sess.id] && CREDS[sess.id].login) || 'O‘qituvchi';
+    }
+    const msg = await serial(async () => {
+      const n = ++CHAT.counter;
+      const m = { id: crypto.randomBytes(8).toString('hex'), seq: n, ver: n, uid: sess.id, name, role: sess.role, text, ts: Date.now(), x: false };
+      CHAT.msgs.push(m);
+      if (CHAT.msgs.length > 500) CHAT.msgs.splice(0, CHAT.msgs.length - 500);
+      await store.set('chat', CHAT);
+      return m;
+    });
+    return send(res, 200, { ok: true, msg });
+  }
+  if (route === 'POST /api/chat/delete') {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const b = await readBody(req);
+    await serial(async () => {
+      const m = CHAT.msgs.find(x => x.id === String(b.id || ''));
+      if (!m || m.x) return;
+      m.x = true;
+      m.text = '';
+      m.ver = ++CHAT.counter;
+      await store.set('chat', CHAT);
+    });
+    return send(res, 200, { ok: true });
+  }
+
+  /* ---- zaxiralar (faqat admin) ---- */
+  if (route === 'GET /api/backups') {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const keys = await store.keys('backup:');
+    return send(res, 200, { dates: keys.map(k => k.slice(7)) });
+  }
+  if (req.method === 'GET' && url.pathname.startsWith('/api/backups/')) {
+    if (sess.role !== 'admin') return fail(res, 403, 'Faqat administrator');
+    const date = url.pathname.slice('/api/backups/'.length);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return fail(res, 400, 'Sana noto‘g‘ri');
+    const b = await store.get('backup:' + date);
+    if (!b) return fail(res, 404, 'Topilmadi');
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="deutsch-school-' + date + '.json"',
+      'Cache-Control': 'no-store'
+    });
+    return res.end(JSON.stringify(b.data, null, 1));
+  }
+
+  return fail(res, 404, 'Topilmadi');
+}
+
+/* ---------------- statik fayllar ---------------- */
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.txt': 'text/plain; charset=utf-8',
+  '.webmanifest': 'application/manifest+json'
+};
+const cache = new Map();
+
+function serveStatic(req, res, url) {
+  let rel = decodeURIComponent(url.pathname);
+  if (rel === '/' || rel === '') rel = '/index.html';
+  // eski to'liq boshqaruv paneli (React qobig'i ichida iframe sifatida ochiladi)
+  const legacy = rel === '/legacy.html';
+  const full = legacy ? path.join(__dirname, 'public', 'index.html') : path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!legacy && !full.startsWith(PUBLIC_DIR + path.sep) && full !== PUBLIC_DIR) {
+    res.writeHead(403);
+    return res.end('Forbidden');
+  }
+  let st;
+  try {
+    st = fs.statSync(full);
+    if (st.isDirectory()) throw new Error('dir');
+  } catch (e) {
+    // SPA: noma'lum yo'llar asosiy sahifaga
+    if (!path.extname(rel)) return serveStatic(req, res, new URL('/', 'http://x'));
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Topilmadi');
+  }
+  const ext = path.extname(full).toLowerCase();
+  const type = MIME[ext] || 'application/octet-stream';
+  const key = full + ':' + st.mtimeMs;
+  let ent = cache.get(key);
+  if (!ent) {
+    const raw = fs.readFileSync(full);
+    const compressible = /^(text|application\/(json|javascript)|image\/svg)/.test(type);
+    ent = {
+      raw,
+      gz: compressible ? zlib.gzipSync(raw, { level: 9 }) : null,
+      etag: '"' + crypto.createHash('sha1').update(raw).digest('hex').slice(0, 20) + '"'
+    };
+    cache.clear();
+    cache.set(key, ent);
+  }
+  const headers = {
+    'Content-Type': type,
+    ETag: ent.etag,
+    'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=86400',
+    Vary: 'Accept-Encoding'
+  };
+  if (req.headers['if-none-match'] === ent.etag) {
+    res.writeHead(304, headers);
+    return res.end();
+  }
+  const useGz = ent.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  if (useGz) headers['Content-Encoding'] = 'gzip';
+  const body = useGz ? ent.gz : ent.raw;
+  headers['Content-Length'] = body.length;
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
+
+/* ---------------- server ---------------- */
+
+const server = http.createServer(async (req, res) => {
+  try {
+    securityHeaders(req, res);
+    const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
+    if (url.pathname.startsWith('/api/')) return await api(req, res, url);
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405);
+      return res.end();
+    }
+    return serveStatic(req, res, url);
+  } catch (e) {
+    const code = e.code && Number.isInteger(e.code) ? e.code : 500;
+    if (code === 500) log('XATO:', e && e.stack ? e.stack : e);
+    if (!res.headersSent) fail(res, code, code === 500 ? 'Server xatosi' : e.message);
+    else res.end();
+  }
+});
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
+async function init() {
+  store = await createStore();
+  log('Saqlash turi:', store.kind);
+
+  const d = await store.get('doc');
+  if (d && isObj(d.data)) DOC = d;
+  ADMIN = await store.get('admin');
+  CREDS = (await store.get('creds')) || {};
+  const ch = await store.get('chat');
+  if (ch && Array.isArray(ch.msgs)) CHAT = ch;
+  META = (await store.get('meta')) || { secret: '' };
+  const gc = await store.get('gchat');
+  if (gc && Array.isArray(gc.msgs)) GCHAT = { enabled: gc.enabled !== false, counter: gc.counter || 0, msgs: gc.msgs, reads: isObj(gc.reads) ? gc.reads : {} };
+  const dmd = await store.get('dm');
+  if (dmd && Array.isArray(dmd.msgs)) DMS = { counter: dmd.counter || 0, msgs: dmd.msgs, reads: isObj(dmd.reads) ? dmd.reads : {} };
+  const nw = await store.get('news');
+  if (nw && Array.isArray(nw.items)) NEWS = { counter: nw.counter || 0, items: nw.items, seen: isObj(nw.seen) ? nw.seen : {} };
+
+  if (!META.secret) {
+    META.secret = process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex');
+    await store.set('meta', META);
+  }
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET !== META.secret) {
+    META.secret = process.env.SESSION_SECRET;
+    await store.set('meta', META);
+  }
+
+  const envUser = (process.env.ADMIN_USER || '').trim();
+  const envPass = process.env.ADMIN_PASSWORD || '';
+  if (!ADMIN && envPass) {
+    ADMIN = { user: envUser || 'admin', hash: await hashPassword(envPass), ver: 1 };
+    await store.set('admin', ADMIN);
+    log('Administrator yaratildi:', ADMIN.user);
+  } else if (ADMIN && process.env.RESET_ADMIN === '1' && envPass) {
+    ADMIN = { user: envUser || ADMIN.user, hash: await hashPassword(envPass), ver: (ADMIN.ver || 1) + 1 };
+    await store.set('admin', ADMIN);
+    log('Administrator paroli tiklandi:', ADMIN.user, '(RESET_ADMIN ni o‘chirib qo‘ying!)');
+  } else if (!ADMIN) {
+    log('DIQQAT: administrator yo‘q. Saytni birinchi ochgan odam hisob yaratadi. ADMIN_USER va ADMIN_PASSWORD o‘rnating.');
+  }
+
+  await new Promise(r => server.listen(PORT, '0.0.0.0', r));
+  log('Deutsch School ishga tushdi: http://localhost:' + PORT);
+}
+
+async function shutdown(sig) {
+  log(sig, 'qabul qilindi, to‘xtatilmoqda...');
+  server.close();
+  try {
+    await chain;
+    await store.close();
+  } catch (e) {}
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('unhandledRejection', e => log('unhandledRejection:', e && e.stack ? e.stack : e));
+
+if (require.main === module) {
+  init().catch(e => {
+    console.error('Ishga tushmadi:', e);
+    process.exit(1);
+  });
+}
+
+module.exports = { init, server };
