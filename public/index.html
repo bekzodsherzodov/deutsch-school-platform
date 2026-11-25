@@ -13034,7 +13034,10 @@ $('#loginForm').addEventListener(
 
   showLogin();
 
-})();
+})().finally(()=>{
+  /* React qobig‘i (iframe) ga: panel tayyor */
+  try{if(window.parent!==window)window.parent.postMessage({ds:'ready'},location.origin)}catch(e){}
+});
 
 </script>
 <style>
