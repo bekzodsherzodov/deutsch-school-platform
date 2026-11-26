@@ -123,9 +123,9 @@ function Table({ head, children }: { head: string[]; children: ReactNode }) {
         <thead className="max-sm:hidden"><tr className="text-sm text-ink-soft">{head.map((h) => <th key={h} className="px-3 pb-3 font-semibold">{h}</th>)}</tr></thead>
         <tbody className={[
           '[&>tr]:border-t [&>tr]:border-brand-100/70 [&_td]:px-3 [&_td]:py-3',
-          'max-sm:block max-sm:[&>tr]:block max-sm:[&>tr]:py-2.5 max-sm:[&>tr:first-child]:border-t-0',
-          'max-sm:[&_td]:flex max-sm:[&_td]:items-center max-sm:[&_td]:justify-between max-sm:[&_td]:gap-4 max-sm:[&_td]:px-1 max-sm:[&_td]:py-1.5',
-          'max-sm:[&_td]:before:content-[attr(data-label)] max-sm:[&_td]:before:text-sm max-sm:[&_td]:before:font-semibold max-sm:[&_td]:before:text-ink-soft',
+          'max-sm:block max-sm:text-sm max-sm:[&>tr]:grid max-sm:[&>tr]:grid-cols-2 max-sm:[&>tr]:gap-x-3 max-sm:[&>tr]:gap-y-2 max-sm:[&>tr]:py-2.5 max-sm:[&>tr:first-child]:border-t-0',
+          'max-sm:[&_td]:block max-sm:[&_td]:min-w-0 max-sm:[&_td]:px-0 max-sm:[&_td]:py-0',
+          'max-sm:[&_td]:before:mb-0.5 max-sm:[&_td]:before:block max-sm:[&_td]:before:content-[attr(data-label)] max-sm:[&_td]:before:text-xs max-sm:[&_td]:before:font-semibold max-sm:[&_td]:before:text-ink-soft',
         ].join(' ')}>{rows}</tbody>
       </table>
     </div>
@@ -240,7 +240,7 @@ export function Results() {
             {rows.map((r, i) => {
               const pct = Math.round((r.correct / r.total) * 100)
               return <tr key={i}><td className="text-ink-soft">{fmtDate(r.date)}</td><td className="font-semibold">{r.subject}</td><td>{r.kind}</td>
-                <td><div className="flex items-center gap-3"><div className="h-2 w-24 overflow-hidden rounded-full bg-brand-100"><div className="h-full rounded-full bg-brand-600" style={{ width: pct + '%' }} /></div><b>{r.correct}/{r.total}</b></div></td></tr>
+                <td><div className="flex items-center gap-2 sm:gap-3"><div className="h-2 w-14 shrink-0 overflow-hidden rounded-full bg-brand-100 sm:w-24"><div className="h-full rounded-full bg-brand-600" style={{ width: pct + '%' }} /></div><b>{r.correct}/{r.total}</b></div></td></tr>
             })}
           </Table>
         )}
