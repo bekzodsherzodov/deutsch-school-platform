@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { Children, cloneElement, isValidElement, type ReactElement, type ReactNode } from 'react'
 import { useGo } from '../components/Shell'
 import Icon from '../components/Icon'
 import { Card, EmptyState, Loading, PageHeader, Pill, QuickAction, StatCard, type Tone } from '../components/ui'
@@ -109,11 +109,24 @@ function FamilyHomeBody({ me, go }: { me: Me; go: (k: string) => void }) {
 }
 
 function Table({ head, children }: { head: string[]; children: ReactNode }) {
+  // Telefonda jadval o‘rniga "yorliq: qiymat" ko‘rinishidagi kartalar chiqadi — gorizontal surish kerak emas.
+  const rows = Children.toArray(children).map((row) => {
+    if (!isValidElement<{ children?: ReactNode }>(row)) return row
+    let i = 0
+    const cells = Children.map(row.props.children, (cell) =>
+      isValidElement(cell) ? cloneElement(cell as ReactElement<Record<string, unknown>>, { 'data-label': head[i++] }) : cell)
+    return cloneElement(row, undefined, cells)
+  })
   return (
-    <div className="thin-scroll overflow-x-auto">
-      <table className="w-full min-w-[420px] text-left text-[15px]">
-        <thead><tr className="text-sm text-ink-soft">{head.map((h) => <th key={h} className="px-3 pb-3 font-semibold">{h}</th>)}</tr></thead>
-        <tbody className="[&>tr]:border-t [&>tr]:border-brand-100/70 [&_td]:px-3 [&_td]:py-3">{children}</tbody>
+    <div className="thin-scroll sm:overflow-x-auto">
+      <table className="w-full text-left text-[15px] sm:min-w-[420px] max-sm:block">
+        <thead className="max-sm:hidden"><tr className="text-sm text-ink-soft">{head.map((h) => <th key={h} className="px-3 pb-3 font-semibold">{h}</th>)}</tr></thead>
+        <tbody className={[
+          '[&>tr]:border-t [&>tr]:border-brand-100/70 [&_td]:px-3 [&_td]:py-3',
+          'max-sm:block max-sm:[&>tr]:block max-sm:[&>tr]:py-2.5 max-sm:[&>tr:first-child]:border-t-0',
+          'max-sm:[&_td]:flex max-sm:[&_td]:items-center max-sm:[&_td]:justify-between max-sm:[&_td]:gap-4 max-sm:[&_td]:px-1 max-sm:[&_td]:py-1.5',
+          'max-sm:[&_td]:before:content-[attr(data-label)] max-sm:[&_td]:before:text-sm max-sm:[&_td]:before:font-semibold max-sm:[&_td]:before:text-ink-soft',
+        ].join(' ')}>{rows}</tbody>
       </table>
     </div>
   )
